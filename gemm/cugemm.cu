@@ -16,6 +16,7 @@
 #define cudaCheck(err) (cudaErrorCheck(err, __FILE__, __LINE__))
 #define cublasCheck(err) (cublasErrorCheck(err, __FILE__, __LINE__))
 #define ROUND_UP_TO_NEAREST(M, N) (((M) + (N)-1) / (N))
+#define BLOCKSIZE 32
 
 enum Algo
 {
@@ -333,7 +334,10 @@ __global__ void runBasic(int M, int N, int K, float alpha, float *A, float *B, f
         for (int i = 0; i < K; ++i)
         {
             // tmp += __A__[x][i] * __B__[i][y]
-            tmp += A[(x * K) + i] * B[(i * N) + y];
+            float A_val=A[(x * K) + i];
+            float B_val=B[(i * N) + y];
+            tmp += A_val*B_val;
+            //tmp += A[(x * K) + i] * B[(i * N) + y];
         }
         // __C__[x][y]
         C[(x * N) + y] = (alpha * tmp) + (beta * C[x * N + y]);
@@ -344,7 +348,21 @@ __global__ void runGmemCoalesced(int M, int N, int K, float alpha, float *A, flo
 {
     // HW1 TODO: copy runBasic() code here and update to avoid uncoalesced accesses to global memory.
     // Note, you are also free to change the grid dimensions in the kernel launch below.
+    const unsigned x = blockIdx.x * BLOCKSIZE + threadIdx.x/BLOCKSIZE;
+    const unsigned y = blockIdx.y * BLOCKSIZE + threadIdx.x%BLOCKSIZE;
 
+    if (x < M && y < N)
+    {
+        float tmp = 0.0;
+        // C = α*(AxB)+β*C
+        for (int i = 0; i < K; ++i)
+        {
+            // tmp += __A__[x][i] * __B__[i][y]
+            tmp += A[(x * K) + i] * B[(i * N) + y];
+        }
+        // __C__[x][y]
+        C[(x * N) + y] = (alpha * tmp) + (beta * C[x * N + y]);
+    }
 }
 
 const uint F = 32;
@@ -392,15 +410,15 @@ void runAlgo(Algo algo, cublasHandle_t handle, int M, int N, int K, float alpha,
         break;
     case basic:
     {
-        dim3 gridDim(ROUND_UP_TO_NEAREST(M, 32), ROUND_UP_TO_NEAREST(N, 32));
-        dim3 blockDim(32, 32);
+        dim3 gridDim(ROUND_UP_TO_NEAREST(M, BLOCKSIZE), ROUND_UP_TO_NEAREST(N, BLOCKSIZE));
+        dim3 blockDim(BLOCKSIZE, BLOCKSIZE);
         runBasic<<<gridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C);
         break;
     }
     case gmem_coalesced:
     {
-        dim3 gridDim(ROUND_UP_TO_NEAREST(M, 32), ROUND_UP_TO_NEAREST(N, 32));
-        dim3 blockDim(32, 32);
+        dim3 gridDim(ROUND_UP_TO_NEAREST(M, BLOCKSIZE), ROUND_UP_TO_NEAREST(N, BLOCKSIZE));
+        dim3 blockDim(BLOCKSIZE*BLOCKSIZE);
         runGmemCoalesced<<<gridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C);
         break;
     }
