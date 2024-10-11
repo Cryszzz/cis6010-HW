@@ -16,6 +16,7 @@
 #define cudaCheck(err) (cudaErrorCheck(err, __FILE__, __LINE__))
 #define cublasCheck(err) (cublasErrorCheck(err, __FILE__, __LINE__))
 #define ROUND_UP_TO_NEAREST(M, N) (((M) + (N)-1) / (N))
+#define BLOCKSIZE_BIT 5
 #define BLOCKSIZE 32
 
 enum Algo
@@ -365,9 +366,9 @@ __global__ void runGmemCoalesced(int M, int N, int K, float alpha, float *A, flo
     }
 }
 
-const uint F = 32;
+const uint F = BLOCKSIZE;
 
-__global__ void runSharedMem(int M, int N, int K, float alpha, float *A, float *B, float beta, float *C)
+__global__ void runSharedMem(int M, int N, int K, int M_bit, int N_bit, int K_bit, float alpha, float *A, float *B, float beta, float *C)
 {
     // HW2 TODO: Use shared memory to cache square FxF tiles of the A and B matrices in shared memory 
     // (SA and SB, respectively, provided below). Each thread should compute the result for one cell 
@@ -379,6 +380,33 @@ __global__ void runSharedMem(int M, int N, int K, float alpha, float *A, float *
 
     __shared__ float SA[F][F];
     __shared__ float SB[F][F];
+    
+    const unsigned thdx = threadIdx.x >> BLOCKSIZE_BIT;
+    const unsigned thdy = threadIdx.x & (BLOCKSIZE - 1);
+
+    const unsigned x = (blockIdx.x << BLOCKSIZE_BIT) + thdx;
+    const unsigned y = (blockIdx.y << BLOCKSIZE_BIT) + thdy;
+
+    if (x < M && y < N)
+    {
+        float tmp = 0.0;
+        // C = α*(AxB)+β*C
+        for (int i = 0; i < K; i += BLOCKSIZE)
+        {
+            // tmp += __A__[x][i] * __B__[i][y]
+
+            SA[thdx][thdy]= A[(x * M) + i + thdy];
+            SB[thdx][thdy]= B[((i+thdx) * N) + y];
+            __syncthreads();
+
+            for(int j = 0; j < BLOCKSIZE; j++){
+                tmp += SA[thdx][j] * SB[j][thdy];
+            }
+            __syncthreads();
+        }
+        // __C__[x][y]
+        C[(x * N) + y] = (alpha * tmp) + (beta * C[x * N + y]);
+    }
 
 }
 
@@ -427,10 +455,13 @@ void runAlgo(Algo algo, cublasHandle_t handle, int M, int N, int K, float alpha,
         assert(0 == M % F);
         assert(0 == N % F);
         assert(0 == K % F);
+        const unsigned M_bit = (M / F) * BLOCKSIZE_BIT;
+        const unsigned N_bit = (N / F) * BLOCKSIZE_BIT;
+        const unsigned K_bit = (K / F) * BLOCKSIZE_BIT;
         // TODO: update your grid here
-        dim3 gridDim(ROUND_UP_TO_NEAREST(M, 32), ROUND_UP_TO_NEAREST(N, 32));
-        dim3 blockDim(32, 32);
-        runSharedMem<<<gridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C);
+        dim3 gridDim(ROUND_UP_TO_NEAREST(M, BLOCKSIZE), ROUND_UP_TO_NEAREST(N, BLOCKSIZE));
+        dim3 blockDim(BLOCKSIZE*BLOCKSIZE);
+        runSharedMem<<<gridDim, blockDim>>>(M, N, K, M_bit, N_bit, K_bit, alpha, A, B, beta, C);
         break;
     }
     case smem_multioutput:
