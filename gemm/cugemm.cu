@@ -366,9 +366,9 @@ __global__ void runGmemCoalesced(int M, int N, int K, float alpha, float *A, flo
     }
 }
 
-const uint F = BLOCKSIZE;
+const uint F = 64;
 
-__global__ void runSharedMem(int M, int N, int K, int M_bit, int N_bit, int K_bit, float alpha, float *A, float *B, float beta, float *C)
+__global__ void runSharedMem(int M, int N, int K, float alpha, float *A, float *B, float beta, float *C)
 {
     // HW2 TODO: Use shared memory to cache square FxF tiles of the A and B matrices in shared memory 
     // (SA and SB, respectively, provided below). Each thread should compute the result for one cell 
@@ -381,17 +381,17 @@ __global__ void runSharedMem(int M, int N, int K, int M_bit, int N_bit, int K_bi
     __shared__ float SA[F][F];
     __shared__ float SB[F][F];
     
-    const unsigned thdx = threadIdx.x >> BLOCKSIZE_BIT;
-    const unsigned thdy = threadIdx.x & (BLOCKSIZE - 1);
+    const unsigned thdx = threadIdx.x / F;
+    const unsigned thdy = threadIdx.x % F;
 
-    const unsigned x = (blockIdx.x << BLOCKSIZE_BIT) + thdx;
-    const unsigned y = (blockIdx.y << BLOCKSIZE_BIT) + thdy;
+    const unsigned x = (blockIdx.x * F) + thdx;
+    const unsigned y = (blockIdx.y * F) + thdy;
 
     if (x < M && y < N)
     {
         float tmp = 0.0;
         // C = α*(AxB)+β*C
-        for (int i = 0; i < K; i += BLOCKSIZE)
+        for (int i = 0; i < K; i += F)
         {
             // tmp += __A__[x][i] * __B__[i][y]
 
@@ -399,7 +399,7 @@ __global__ void runSharedMem(int M, int N, int K, int M_bit, int N_bit, int K_bi
             SB[thdx][thdy]= B[((i+thdx) * N) + y];
             __syncthreads();
 
-            for(int j = 0; j < BLOCKSIZE; j++){
+            for(int j = 0; j < F; j++){
                 tmp += SA[thdx][j] * SB[j][thdy];
             }
             __syncthreads();
@@ -411,6 +411,7 @@ __global__ void runSharedMem(int M, int N, int K, int M_bit, int N_bit, int K_bi
 }
 
 const uint G = 4;
+const uint STRIDE = F/G;
 
 __global__ void runSharedMemMultiOutput(int M, int N, int K, float alpha, float *A, float *B, float beta, float *C)
 {
@@ -423,8 +424,50 @@ __global__ void runSharedMemMultiOutput(int M, int N, int K, float alpha, float 
 
     __shared__ float SA[F][F];
     __shared__ float SB[F][F];
+    
+    const unsigned thdx = (threadIdx.x / STRIDE)*G;
+    const unsigned thdy = (threadIdx.x % STRIDE)*G;
 
-    float LC[G][G] = {0.0};
+    const unsigned x = blockIdx.x * F + thdx;
+    const unsigned y = blockIdx.y * F + thdy;
+
+    if (x < M && y < N)
+    {
+        float tmp[G][G]={0};
+        // C = α*(AxB)+β*C
+        for (int i = 0; i < K; i += F)
+        {
+            #pragma unroll
+            for(int j=0; j<G ;j++){
+                #pragma unroll
+                for(int k=0;k<G;k++){
+                    SA[thdx+j][thdy+k]= A[((x+j) * M) + i+ k + thdy];
+                    SB[thdx+j][thdy+k]= B[((i+thdx+j) * N) + y+k];
+                }
+            }
+            __syncthreads();
+
+            for(int idx = 0; idx < F; idx++){
+                #pragma unroll
+                for(int j=0; j<G ;j++){
+                    #pragma unroll
+                    for(int k=0;k<G;k++){
+                        tmp[j][k] += SA[thdx+j][idx] * SB[idx][thdy+k];
+                    }
+                }
+            }
+            __syncthreads();
+        }
+        // __C__[x][y]
+        #pragma unroll
+        for(int j=0; j<G ;j++){
+            #pragma unroll
+            for(int k=0;k<G;k++){
+                C[((x+j) * N) + (y+k)] = (alpha * tmp[j][k]) + (beta * C[(x+j) * N + (y+k)]);
+            }
+        }
+        //C[(x * N) + y] = tmp[0][0];
+    }
 
 }
 
@@ -455,13 +498,10 @@ void runAlgo(Algo algo, cublasHandle_t handle, int M, int N, int K, float alpha,
         assert(0 == M % F);
         assert(0 == N % F);
         assert(0 == K % F);
-        const unsigned M_bit = (M / F) * BLOCKSIZE_BIT;
-        const unsigned N_bit = (N / F) * BLOCKSIZE_BIT;
-        const unsigned K_bit = (K / F) * BLOCKSIZE_BIT;
         // TODO: update your grid here
-        dim3 gridDim(ROUND_UP_TO_NEAREST(M, BLOCKSIZE), ROUND_UP_TO_NEAREST(N, BLOCKSIZE));
-        dim3 blockDim(BLOCKSIZE*BLOCKSIZE);
-        runSharedMem<<<gridDim, blockDim>>>(M, N, K, M_bit, N_bit, K_bit, alpha, A, B, beta, C);
+        dim3 gridDim(ROUND_UP_TO_NEAREST(M, F), ROUND_UP_TO_NEAREST(N, F));
+        dim3 blockDim(F*F);
+        runSharedMem<<<gridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C);
         break;
     }
     case smem_multioutput:
@@ -472,8 +512,8 @@ void runAlgo(Algo algo, cublasHandle_t handle, int M, int N, int K, float alpha,
         assert(0 == F % G);
         assert((F*F) / (G*G) >= F);
         // TODO: update your grid here
-        dim3 gridDim(ROUND_UP_TO_NEAREST(M, 32), ROUND_UP_TO_NEAREST(N, 32));
-        dim3 blockDim(32, 32);
+        dim3 gridDim(ROUND_UP_TO_NEAREST(M,F), ROUND_UP_TO_NEAREST(N, F));
+        dim3 blockDim(STRIDE*STRIDE);
         runSharedMemMultiOutput<<<gridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C);
         break;
     }
